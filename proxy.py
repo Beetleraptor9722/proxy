@@ -56,9 +56,4 @@ async def proxy(path: str, request: Request):
         response_headers = dict(upstream.headers)
 
         # Возвращаем StreamingResponse с upstream статусом и заголовками
-        return StreamingResponse(iter_upstream(), status_code=upstream.status_code, headers=response_headers)       except Exception as e:
-            raise HTTPException(status_code=502, detail=str(e))
-
-    # Скопируем заголовки, исключая hop-by-hop
-    resp_headers = {k:v for k,v in upstream.headers.items() if k.lower() not in ("connection","keep-alive","transfer-encoding","content-encoding")}
-    return Response(content=upstream.content, status_code=upstream.status_code, headers=resp_headers)
+        return StreamingResponse(iter_upstream(), status_code=upstream.status_code, headers=response_headers)
