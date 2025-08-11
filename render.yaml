@@ -1,0 +1,11 @@
+services:
+- type: web
+  name: proxy
+  runtime: python
+  repo: https://github.com/Beetleraptor9722/proxy
+  plan: free
+  region: oregon
+  buildCommand: pip install -r req.txt
+  startCommand: uvicorn proxy:app --host 0.0.0.0 --port 8000
+  autoDeployTrigger: commit
+version: "1"
