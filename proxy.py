@@ -17,8 +17,17 @@ async def proxy(path: str, request: Request):
             headers=headers,
             content=body
         ) as upstream:
+
+            async def content_generator():
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        yield chunk
+                except httpx.StreamClosed:
+                    # Поток закрыт — безопасно просто завершить генератор
+                    return
+
             return StreamingResponse(
-                upstream.aiter_raw(),
+                content_generator(),
                 status_code=upstream.status_code,
                 headers=dict(upstream.headers)
             )
