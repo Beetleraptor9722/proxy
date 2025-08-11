@@ -2,13 +2,14 @@
 # pip install fastapi uvicorn httpx
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import logging
 
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("proxy")
-app = FastAPI()
 
+# Заголовки, которые не следует пробрасывать в ответ клиенту
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -21,26 +22,30 @@ HOP_BY_HOP = {
     "content-length",
 }
 
+app = FastAPI()
+
 @app.api_route("/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD"])
 async def proxy(path: str, request: Request):
     """
-    Проксирует запросы к https://api.openai.com/{path}
-    Пробрасывает тело ответа (стримит) напрямую клиенту.
+    Проксирует любой запрос к https://api.openai.com/{path}
+    - Пробрасывает все входящие заголовки вверх, но фиксирует Host для OpenAI.
+    - Стримит тело ответа напрямую клиенту.
     """
-    # Читаем тело запроса (может быть пустым)
+    # читаем тело запроса (может быть пустым)
     body = await request.body()
 
-    # Копируем все входящие заголовки и фиксируем Host для OpenAI
+    # Собираем заголовки, которые отправим к OpenAI
     upstream_request_headers = dict(request.headers)
+    # критично: выставляем корректный Host для OpenAI (иначе 421)
     upstream_request_headers["host"] = "api.openai.com"
-    # (опционально) убрать accept-encoding, чтобы получить разжатый ответ
+    # проще получить "вменяемый" ответ — убираем accept-encoding (httpx сам разожмёт если нужно)
     upstream_request_headers.pop("accept-encoding", None)
 
     url = f"https://api.openai.com/{path}"
 
     try:
         async with httpx.AsyncClient(timeout=None) as client:
-            # stream через контекст-менеджер — корректный способ с современной httpx
+            # корректный способ стриминга в новой версии httpx
             async with client.stream(
                 request.method,
                 url,
@@ -48,26 +53,32 @@ async def proxy(path: str, request: Request):
                 content=body if body else None,
             ) as upstream:
 
-                # Подготовим заголовки для ответа — удаляем hop-by-hop, content-length и transfer-encoding
+                log.info("Upstream status: %s %s", upstream.status_code, url)
+
+                # Формируем заголовки ответа клиенту, но удаляем hop-by-hop и content-length
                 response_headers = {
                     k: v for k, v in upstream.headers.items()
                     if k.lower() not in HOP_BY_HOP
                 }
 
-                # Генератор, который отдаёт байты upstream напрямую клиенту
+                # Для HEAD — возвращаем только заголовки (без тела)
+                if request.method.upper() == "HEAD":
+                    return JSONResponse({}, status_code=upstream.status_code, headers=response_headers)
+
+                # Генератор: напрямую стримим сырые байты upstream
                 async def stream_generator():
                     try:
                         async for chunk in upstream.aiter_raw():
                             if chunk:
                                 yield chunk
                     except Exception as exc:
-                        # upstream закрылся или другая ошибка — просто завершиться
-                        log.debug("Upstream stream error: %s", exc)
+                        # upstream мог закрыться — логируем и завершаем стрим без выброса ошибки наружу
+                        log.debug("Upstream stream error (will terminate): %s", exc)
                         return
                     finally:
-                        # всегда закрываем upstream
                         await upstream.aclose()
 
+                # Возвращаем StreamingResponse — uvicorn сам выберет chunked transfer
                 return StreamingResponse(
                     stream_generator(),
                     status_code=upstream.status_code,
@@ -75,5 +86,5 @@ async def proxy(path: str, request: Request):
                 )
 
     except httpx.RequestError as e:
-        log.exception("Ошибка соединения с upstream: %s", e)
+        log.exception("Ошибка соединения с OpenAI: %s", e)
         raise HTTPException(status_code=502, detail="upstream_connection_error")
