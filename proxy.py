@@ -1,8 +1,5 @@
-# proxy.py
-# pip install fastapi uvicorn httpx
-
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 import httpx
 import logging
 
@@ -18,27 +15,23 @@ HOP_BY_HOP = {
     "trailers",
     "transfer-encoding",
     "upgrade",
-    "content-length",  # не пробрасываем content-length назад при стриминге
+    "content-length",
 }
+
+# Порог для "малого" ответа — читаем целиком (1MB)
+SMALL_RESPONSE_THRESHOLD = 1 * 1024 * 1024
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy(path: str, request: Request):
-    # 1) Защита: проксируем только OpenAI API пути (избегаем проброса "/" и других корневых запросов)
-    # Если хотите универсальный прокси — уберите этот check, но тогда ожидайте 421 если Host не скорректирован.
+    # Проксируем только OpenAI-пути (или убери этот check если нужен универсальный)
     if not path.startswith("v1/"):
-        # Например, GET / -> 404 или 405, HEAD -> 405
-        if request.method == "HEAD":
-            return JSONResponse({"error": "misdirected_or_not_allowed"}, status_code=405)
         return JSONResponse({"error": "only /v1/* paths are proxied"}, status_code=404)
 
     body = await request.body()
-
-    # 2) Берём все входящие заголовки, но принудительно ставим корректный Host для OpenAI
-    upstream_headers = dict(request.headers)
-    upstream_headers["host"] = "api.openai.com"
-
-    # (опционально) Можно удалить Accept-Encoding, чтобы не усложнять декодирование:
-    upstream_headers.pop("accept-encoding", None)
+    upstream_request_headers = dict(request.headers)
+    # Принудительно корректный Host для OpenAI
+    upstream_request_headers["host"] = "api.openai.com"
+    upstream_request_headers.pop("accept-encoding", None)  # просим незжатый ответ
 
     url = f"https://api.openai.com/{path}"
 
@@ -47,39 +40,54 @@ async def proxy(path: str, request: Request):
             async with client.stream(
                 request.method,
                 url,
-                headers=upstream_headers,
-                content=body if body else None
+                headers=upstream_request_headers,
+                content=body if body else None,
             ) as upstream:
 
-                # Подготовка заголовков ответа: удаляем hop-by-hop и content-length
+                # Лог upstream статуса и некоторых заголовков (для отладки)
+                log.info("upstream status=%s", upstream.status_code)
+                log.debug("upstream headers=%s", dict(upstream.headers))
+
+                # Подготовим заголовки для ответа (удаляем hop-by-hop и content-length)
                 response_headers = {
-                    k: v
-                    for k, v in upstream.headers.items()
-                    if k.lower() not in HOP_BY_HOP
+                    k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP
                 }
 
-                # Генератор для стриминга — ловим StreamClosed и завершаем корректно
+                # Если upstream указал content-length и он небольшой -> прочитаем целиком и вернём Response
+                clen = upstream.headers.get("Content-Length") or upstream.headers.get("content-length")
+                try:
+                    clen_val = int(clen) if clen is not None else None
+                except Exception:
+                    clen_val = None
+
+                if clen_val is not None and clen_val <= SMALL_RESPONSE_THRESHOLD:
+                    # безопасно прочитать весь ответ
+                    content_bytes = await upstream.aread()
+                    # если content-type отсутствует — добавим дефолт
+                    if "content-type" not in {k.lower() for k in response_headers}:
+                        response_headers["content-type"] = "application/octet-stream"
+                    return Response(content=content_bytes, status_code=upstream.status_code, headers=response_headers)
+
+                # Если нет явного Content-Length — попробуем прочитать небольшую часть non-blocking:
+                # Но в общем случае — стримим
                 async def gen():
                     try:
                         async for chunk in upstream.aiter_bytes():
-                            if chunk:
-                                yield chunk
+                            # yield даже пустые чанки не нужны — но пропустим None
+                            if chunk is None:
+                                continue
+                            yield chunk
                     except httpx.StreamClosed:
-                        # upstream закрыл поток — аккуратно завершаем генератор
-                        log.info("upstream stream closed early (likely upstream error or client disconnected)")
+                        # upstream закрыл поток — логируем и заканчиваем генератор
+                        log.info("upstream stream closed early")
                         return
                     except Exception as exc:
                         log.exception("Ошибка при чтении upstream stream: %s", exc)
                         return
                     finally:
-                        # гарантированно закрываем upstream
                         await upstream.aclose()
 
-                return StreamingResponse(
-                    gen(),
-                    status_code=upstream.status_code,
-                    headers=response_headers
-                )
+                return StreamingResponse(gen(), status_code=upstream.status_code, headers=response_headers)
 
         except httpx.RequestError as e:
             log.exception("Ошибка соединения с OpenAI: %s", e)
