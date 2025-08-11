@@ -1,10 +1,13 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+# proxy.py
+# pip install fastapi uvicorn httpx
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import logging
 
-app = FastAPI()
 log = logging.getLogger("proxy")
+app = FastAPI()
 
 HOP_BY_HOP = {
     "connection",
@@ -15,17 +18,27 @@ HOP_BY_HOP = {
     "trailers",
     "transfer-encoding",
     "upgrade",
-    # убираем content-length, т.к. при стриминге его нельзя надёжно пробрасывать
-    "content-length",
+    "content-length",  # не пробрасываем content-length назад при стриминге
 }
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy(path: str, request: Request):
+    # 1) Защита: проксируем только OpenAI API пути (избегаем проброса "/" и других корневых запросов)
+    # Если хотите универсальный прокси — уберите этот check, но тогда ожидайте 421 если Host не скорректирован.
+    if not path.startswith("v1/"):
+        # Например, GET / -> 404 или 405, HEAD -> 405
+        if request.method == "HEAD":
+            return JSONResponse({"error": "misdirected_or_not_allowed"}, status_code=405)
+        return JSONResponse({"error": "only /v1/* paths are proxied"}, status_code=404)
+
     body = await request.body()
-    # все входящие заголовки пробрасываем вверх к OpenAI
-    upstream_request_headers = dict(request.headers)
-    # важно: корректный Host для OpenAI (если хотите, можно не менять)
-    upstream_request_headers["host"] = "api.openai.com"
+
+    # 2) Берём все входящие заголовки, но принудительно ставим корректный Host для OpenAI
+    upstream_headers = dict(request.headers)
+    upstream_headers["host"] = "api.openai.com"
+
+    # (опционально) Можно удалить Accept-Encoding, чтобы не усложнять декодирование:
+    upstream_headers.pop("accept-encoding", None)
 
     url = f"https://api.openai.com/{path}"
 
@@ -34,28 +47,32 @@ async def proxy(path: str, request: Request):
             async with client.stream(
                 request.method,
                 url,
-                headers=upstream_request_headers,
+                headers=upstream_headers,
                 content=body if body else None
             ) as upstream:
 
-                # подготовка заголовков ответа: копируем, но удаляем hop-by-hop + content-length
+                # Подготовка заголовков ответа: удаляем hop-by-hop и content-length
                 response_headers = {
                     k: v
                     for k, v in upstream.headers.items()
                     if k.lower() not in HOP_BY_HOP
                 }
 
-                # генератор для стриминга. закрываем upstream в finally
+                # Генератор для стриминга — ловим StreamClosed и завершаем корректно
                 async def gen():
                     try:
                         async for chunk in upstream.aiter_bytes():
-                            # chunk может быть пустым в редких случаях — пропускаем
                             if chunk:
                                 yield chunk
+                    except httpx.StreamClosed:
+                        # upstream закрыл поток — аккуратно завершаем генератор
+                        log.info("upstream stream closed early (likely upstream error or client disconnected)")
+                        return
                     except Exception as exc:
-                        # логируем, но не пробрасываем исключение в клиент (короткий и безопасный fail)
                         log.exception("Ошибка при чтении upstream stream: %s", exc)
+                        return
                     finally:
+                        # гарантированно закрываем upstream
                         await upstream.aclose()
 
                 return StreamingResponse(
@@ -65,6 +82,5 @@ async def proxy(path: str, request: Request):
                 )
 
         except httpx.RequestError as e:
-            log.exception("Ошибка при соединении с upstream: %s", e)
-            # отдаём простой 502 с текстом
-            return StreamingResponse(iter([b'{"error":"upstream_connection_error"}']), status_code=502, headers={"content-type":"application/json"})
+            log.exception("Ошибка соединения с OpenAI: %s", e)
+            raise HTTPException(status_code=502, detail="upstream_connection_error")
