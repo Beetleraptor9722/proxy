@@ -69,3 +69,7 @@ async def proxy(path: str, request: Request):
     except httpx.RequestError as e:
         log.exception("Upstream connection error: %s", e)
         raise HTTPException(status_code=502, detail="upstream_connection_error")
+        
+@app.get("/", status_code=421)
+async def root():
+    return Response(status_code=421)
